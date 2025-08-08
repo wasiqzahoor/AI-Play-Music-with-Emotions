@@ -1,0 +1,260 @@
+import mediapipe as mp
+import numpy as np
+import cv2
+import os
+from tensorflow.keras.utils import to_categorical
+from keras.layers import Input, Dense
+from keras.models import Model, load_model
+import tkinter as tk
+from tkinter import simpledialog, messagebox
+import urllib.parse
+import webbrowser
+import time
+
+# Global variables for MediaPipe
+holistic = mp.solutions.holistic
+holis = holistic.Holistic()
+drawing = mp.solutions.drawing_utils
+hands = mp.solutions.hands
+
+# --- Data Collection Function ---
+def collect_data():
+    """
+    Collects facial and hand landmark data from the webcam for training.
+    """
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        messagebox.showerror("Error", "Could not open webcam.")
+        return
+
+    root = tk.Tk()
+    root.withdraw()
+    name = simpledialog.askstring("Input", "Enter the name for the new data (e.g., 'happy', 'sad'):")
+    root.destroy()
+    
+    if not name:
+        messagebox.showinfo("Cancelled", "Data collection cancelled.")
+        cap.release()
+        return
+
+    X = []
+    data_size = 0
+    max_data = 100
+
+    while True:
+        lst = []
+        ret, frm = cap.read()
+        if not ret:
+            break
+
+        frm = cv2.flip(frm, 1)
+        res = holis.process(cv2.cvtColor(frm, cv2.COLOR_BGR2RGB))
+
+        if res.face_landmarks:
+            # Face landmarks processing
+            for i in res.face_landmarks.landmark:
+                lst.append(i.x - res.face_landmarks.landmark[1].x)
+                lst.append(i.y - res.face_landmarks.landmark[1].y)
+
+            # Left hand landmarks processing
+            if res.left_hand_landmarks:
+                for i in res.left_hand_landmarks.landmark:
+                    lst.append(i.x - res.left_hand_landmarks.landmark[8].x)
+                    lst.append(i.y - res.left_hand_landmarks.landmark[8].y)
+            else:
+                for _ in range(42):  # 21 landmarks * 2 coordinates (x, y)
+                    lst.append(0.0)
+
+            # Right hand landmarks processing
+            if res.right_hand_landmarks:
+                for i in res.right_hand_landmarks.landmark:
+                    lst.append(i.x - res.right_hand_landmarks.landmark[8].x)
+                    lst.append(i.y - res.right_hand_landmarks.landmark[8].y)
+            else:
+                for _ in range(42):
+                    lst.append(0.0)
+
+            X.append(lst)
+            data_size += 1
+
+        drawing.draw_landmarks(frm, res.face_landmarks, holistic.FACEMESH_CONTOURS)
+        drawing.draw_landmarks(frm, res.left_hand_landmarks, hands.HAND_CONNECTIONS)
+        drawing.draw_landmarks(frm, res.right_hand_landmarks, hands.HAND_CONNECTIONS)
+
+        cv2.putText(frm, f"Data points: {data_size}/{max_data}", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        cv2.putText(frm, f"Action: {name}", (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+
+        cv2.imshow("Data Collection", frm)
+
+        if cv2.waitKey(1) == 27 or data_size >= max_data:
+            break
+
+    cv2.destroyAllWindows()
+    cap.release()
+    
+    if data_size > 0:
+        np.save(f"{name}.npy", np.array(X))
+        messagebox.showinfo("Success", f"Successfully saved {data_size} data points for '{name}'.")
+    else:
+        messagebox.showwarning("Warning", "No data was collected.")
+
+# --- Data Training Function ---
+def train_model():
+    """
+    Loads data, trains the model, and saves it.
+    """
+    is_init = False
+    size = -1
+    label = []
+    dictionary = {}
+    c = 0
+    
+    data_files = [f for f in os.listdir() if f.endswith(".npy") and f != "labels.npy"]
+
+    if not data_files:
+        messagebox.showerror("Error", "No training data files found (.npy). Please collect data first.")
+        return
+
+    print("Loading data for training...")
+    for i in data_files:
+        data = np.load(i)
+        if not is_init:
+            is_init = True
+            X = data
+            size = X.shape[0]
+            y = np.array([i.split('.')[0]] * size).reshape(-1, 1)
+        else:
+            X = np.concatenate((X, data))
+            y = np.concatenate((y, np.array([i.split('.')[0]] * size).reshape(-1, 1)))
+
+        label.append(i.split('.')[0])
+        dictionary[i.split('.')[0]] = c
+        c += 1
+
+    for i in range(y.shape[0]):
+        y[i, 0] = dictionary[y[i, 0]]
+    y = np.array(y, dtype="int32")
+    y = to_categorical(y)
+
+    # Shuffling the data
+    cnt = np.arange(X.shape[0])
+    np.random.shuffle(cnt)
+    X_new = X[cnt]
+    y_new = y[cnt]
+    
+    print("Training model...")
+    ip = Input(shape=(X.shape[1]))
+    m = Dense(512, activation="relu")(ip)
+    m = Dense(256, activation="relu")(m)
+    op = Dense(y.shape[1], activation="softmax")(m)
+    model = Model(inputs=ip, outputs=op)
+    model.compile(optimizer='rmsprop', loss="categorical_crossentropy", metrics=['acc'])
+    model.fit(X_new, y_new, epochs=50)
+
+    model.save("model.h5")
+    np.save("labels.npy", np.array(label))
+    messagebox.showinfo("Success", "Model trained and saved successfully!")
+
+# --- Inference Function ---
+def run_inference():
+    """
+    Runs the trained model on webcam feed to predict gestures/emotions.
+    If the predicted gesture is "play", it opens a Youtube.
+    """
+    try:
+        model = load_model("model.h5")
+        label = np.load("labels.npy")
+    except (IOError, ValueError) as e:
+        messagebox.showerror("Error", f"Model or labels file not found. Please train the model first. Error: {e}")
+        return
+
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        messagebox.showerror("Error", "Could not open webcam.")
+        return
+
+    last_prediction_time = time.time()
+    prediction_interval = 1 # seconds
+
+    while True:
+        lst = []
+        ret, frm = cap.read()
+        if not ret:
+            break
+
+        frm = cv2.flip(frm, 1)
+        res = holis.process(cv2.cvtColor(frm, cv2.COLOR_BGR2RGB))
+        
+        current_time = time.time()
+        
+        if res.face_landmarks and (current_time - last_prediction_time) > prediction_interval:
+            # Face landmarks processing
+            for i in res.face_landmarks.landmark:
+                lst.append(i.x - res.face_landmarks.landmark[1].x)
+                lst.append(i.y - res.face_landmarks.landmark[1].y)
+
+            # Left hand landmarks processing
+            if res.left_hand_landmarks:
+                for i in res.left_hand_landmarks.landmark:
+                    lst.append(i.x - res.left_hand_landmarks.landmark[8].x)
+                    lst.append(i.y - res.left_hand_landmarks.landmark[8].y)
+            else:
+                for _ in range(42):
+                    lst.append(0.0)
+
+            # Right hand landmarks processing
+            if res.right_hand_landmarks:
+                for i in res.right_hand_landmarks.landmark:
+                    lst.append(i.x - res.right_hand_landmarks.landmark[8].x)
+                    lst.append(i.y - res.right_hand_landmarks.landmark[8].y)
+            else:
+                for _ in range(42):
+                    lst.append(0.0)
+
+            lst = np.array(lst).reshape(1, -1)
+            pred_index = np.argmax(model.predict(lst))
+            pred = label[pred_index]
+            
+            # --- Advanced Feature: Play Music ---
+            if "play" in pred.lower():
+                webbrowser.open(f"https://www.youtube.com/results?search_query={urllib.parse.quote('motivational music')}")
+                messagebox.showinfo("Action", "Playing motivational music on YouTube.")
+                time.sleep(3) # Wait for browser to open and show message
+            
+            cv2.putText(frm, pred, (50, 50), cv2.FONT_HERSHEY_DUPLEX, 1, (255, 0, 0), 2)
+            last_prediction_time = current_time
+
+        drawing.draw_landmarks(frm, res.face_landmarks, holistic.FACEMESH_CONTOURS)
+        drawing.draw_landmarks(frm, res.left_hand_landmarks, hands.HAND_CONNECTIONS)
+        drawing.draw_landmarks(frm, res.right_hand_landmarks, hands.HAND_CONNECTIONS)
+
+        cv2.imshow("Inference", frm)
+
+        if cv2.waitKey(1) == 27:
+            break
+
+    cv2.destroyAllWindows()
+    cap.release()
+
+# --- Main Menu UI ---
+def main_menu():
+    """
+    Provides a simple Tkinter menu to choose an action.
+    """
+    window = tk.Tk()
+    window.title("AI Gesture Assistant Menu")
+    window.geometry("400x200")
+    
+    style = ttk.Style()
+    style.configure("TButton", font=("Helvetica", 12), padding=10)
+    
+    ttk.Label(window, text="Select an action:", font=("Helvetica", 16)).pack(pady=20)
+    
+    ttk.Button(window, text="1. Collect Data", command=collect_data).pack(fill='x', padx=50, pady=5)
+    ttk.Button(window, text="2. Train Model", command=train_model).pack(fill='x', padx=50, pady=5)
+    ttk.Button(window, text="3. Run Inference", command=run_inference).pack(fill='x', padx=50, pady=5)
+    
+    window.mainloop()
+
+if __name__ == "__main__":
+    main_menu()
